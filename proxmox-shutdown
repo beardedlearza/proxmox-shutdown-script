@@ -1,4 +1,4 @@
-##!/bin/bash
+#!/bin/bash
 # Proxmox Staggered Shutdown Script
 # Gracefully shuts down all running LXC containers and VMs with staggered delays
 # to reduce load spikes and ensure proper shutdown sequence
@@ -13,8 +13,13 @@ QM=/usr/sbin/qm
 # Configuration
 LOG_FILE="/var/log/proxmox-midnight-shutdown.log"
 STAGGER_DELAY=5          # Seconds between each shutdown command
-SHUTDOWN_TIMEOUT=300     # Maximum wait time for all shutdowns (5 minutes)
-FORCE_STOP_TIMEOUT=600   # Maximum wait for force stop (10 minutes total)
+SHUTDOWN_TIMEOUT=300     # Maximum wait time for graceful shutdown (5 minutes)
+FORCE_STOP_TIMEOUT=600   # Maximum total wait including force stop (10 minutes)
+FORCE_STOP_WAIT=$((FORCE_STOP_TIMEOUT - SHUTDOWN_TIMEOUT))  # Time to wait after force stop
+
+# Safety checks
+command -v "$PCT" >/dev/null 2>&1 || { echo "ERROR: $PCT not found — is this a Proxmox host?"; exit 1; }
+command -v "$QM" >/dev/null 2>&1  || { echo "ERROR: $QM not found — is this a Proxmox host?"; exit 1; }
 
 # Ensure log directory exists and is writable
 LOG_DIR=$(dirname "$LOG_FILE")
@@ -75,7 +80,6 @@ for ctid in $($PCT list | awk 'NR>1 && $2=="running" {print $1}'); do
     CT_NAME=$($PCT config "$ctid" | grep "^hostname:" | cut -d' ' -f2 || echo "unknown")
     log_message "[$CT_COUNT/$INITIAL_CT] Stopping LXC $ctid ($CT_NAME)..."
 
-    # Run shutdown with extended timeout and capture output
     OUTPUT=$($PCT shutdown "$ctid" --timeout 120 2>&1)
     RET=$?
 
@@ -87,7 +91,6 @@ for ctid in $($PCT list | awk 'NR>1 && $2=="running" {print $1}'); do
         log_message "  ⚠ LXC $ctid did not stop cleanly (will force later)"
     fi
 
-    # Stagger delay (skip on last one)
     if [ "$CT_COUNT" -lt "$INITIAL_CT" ]; then
         sleep "$STAGGER_DELAY"
     fi
@@ -95,9 +98,11 @@ done
 
 if [ "$CT_COUNT" -gt 0 ]; then
     log_message "All $CT_COUNT LXC shutdown commands sent"
+    sleep "$STAGGER_DELAY"
 else
     log_message "No LXC containers to shut down"
 fi
+
 # Phase 2: Shutdown VMs one by one with stagger
 log_message ""
 log_message "PHASE 2: Shutting down VMs with ${STAGGER_DELAY}s stagger..."
@@ -109,13 +114,13 @@ for vmid in $($QM list | awk 'NR>1 && $3=="running" {print $1}'); do
     VM_NAME=$($QM config "$vmid" | grep "^name:" | cut -d' ' -f2 || echo "unknown")
     log_message "[$VM_COUNT/$INITIAL_VM] Stopping VM $vmid ($VM_NAME)..."
 
-    if $QM shutdown "$vmid" 2>&1 | tee -a "$LOG_FILE"; then
+    $QM shutdown "$vmid" --timeout 120 2>&1 | tee -a "$LOG_FILE"
+    if [ "${PIPESTATUS[0]}" -eq 0 ]; then
         log_message "  ✓ Shutdown command sent to VM $vmid"
     else
         log_message "  ⚠ Warning: Failed to send shutdown to VM $vmid"
     fi
 
-    # Stagger delay (skip on last one)
     if [ "$VM_COUNT" -lt "$INITIAL_VM" ]; then
         sleep "$STAGGER_DELAY"
     fi
@@ -171,7 +176,10 @@ if [ "$RUNNING_CT" -gt 0 ]; then
     for ctid in $($PCT list | awk 'NR>1 && $2=="running" {print $1}'); do
         CT_NAME=$($PCT config "$ctid" | grep "^hostname:" | cut -d' ' -f2 || echo "unknown")
         log_message "  Force stopping LXC $ctid ($CT_NAME)..."
-        $PCT stop "$ctid" 2>&1 | tee -a "$LOG_FILE" || log_message "  ⚠ Failed to force stop LXC $ctid"
+        $PCT stop "$ctid" 2>&1 | tee -a "$LOG_FILE"
+        if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+            log_message "  ⚠ Failed to force stop LXC $ctid"
+        fi
         sleep 2
     done
 fi
@@ -182,17 +190,20 @@ if [ "$RUNNING_VM" -gt 0 ]; then
     for vmid in $($QM list | awk 'NR>1 && $3=="running" {print $1}'); do
         VM_NAME=$($QM config "$vmid" | grep "^name:" | cut -d' ' -f2 || echo "unknown")
         log_message "  Force stopping VM $vmid ($VM_NAME)..."
-        $QM stop "$vmid" 2>&1 | tee -a "$LOG_FILE" || log_message "  ⚠ Failed to force stop VM $vmid"
+        $QM stop "$vmid" 2>&1 | tee -a "$LOG_FILE"
+        if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+            log_message "  ⚠ Failed to force stop VM $vmid"
+        fi
         sleep 2
     done
 fi
 
-# Final verification
+# Final verification after force stop
 log_message ""
 log_message "Verifying force stop completion..."
 
 FORCE_ELAPSED=0
-while [ $FORCE_ELAPSED -lt $((FORCE_STOP_TIMEOUT - SHUTDOWN_TIMEOUT)) ]; do
+while [ $FORCE_ELAPSED -lt $FORCE_STOP_WAIT ]; do
     RUNNING_CT=$($PCT list | awk 'NR>1 && $2=="running"' | wc -l)
     RUNNING_VM=$($QM list | awk 'NR>1 && $3=="running"' | wc -l)
 
